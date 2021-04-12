@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+import sys, socket, select, time, json, random, math
+
+# Your ID number
+my_id = sys.argv[1]
+
+# The ID numbers of all the other replicas
+replica_ids = sys.argv[2:]
+
+leader = 'FFFF'
+replica_roles = {}
+timeout = random.randint(150, 300)
+term = 0
+voted_id = ''
+vote_count = 0
+quorum = {}
+client_msg = {}
+commit_index = -1
+next_index = []
+
+state_machine = {}
+transaction_log = []
+request_queue = []
+
+
+#####################################################
+
+# Message Fields
+TYPE = 'type'
+SRCE = 'src'
+DEST = 'dst'
+REDR = 'redirect'
+LEAD = 'leader'
+FOLL = 'follower'
+CAND = 'candidate'
+MID = 'MID'
+VAL = 'value' 
+REQV = 'requestvote'
+VOTE = 'voteresponse'
+TERM = 'term'
+APEN = 'appendEntries'
+COMD = 'command'
+KEY = 'key'
+PLI = 'previousLogIndex'
+PLT = 'previousLogTerm'
+ENTR = 'entry'
+READ = 'ready'
+LCOM = 'leaderCommit'
+KEY = 'key'
+HRT = 'heartbeat'
+LLI = 'lastLogIndex'
+LLT = 'lastLogTerm'
+
+#print(replica_ids)
+replica_roles.update({my_id: FOLL})
+for id_ in replica_ids:
+    replica_roles.update({id_: FOLL})
+#print(replica_roles)
+
+# send out a heartbeat msg about who the leader is and log entries
+
+
+######################## LEADER ELECTION ########################
+
+# when there is a timeout find a new leader
+def election(sock):
+    global term
+    term = term + 1
+    last_index = len(transaction_log) - 1
+    voted_id = my_id
+    if last_index >= 0:
+        last_term = transaction_log[last_index][TERM]
+    else:
+        last_term = None
+    replica_roles[my_id] = CAND
+    voted_id = my_id 
+    for replica in replica_ids:
+        msg = {SRCE: my_id,
+               DEST: replica,
+               LEAD: 'FFFF',
+               TYPE: REQV,
+               TERM: term,
+               LLI:  last_index,
+               LLT: last_term}
+        sock.send(json.dumps(msg).encode())
+    #print("%s requested votes" % my_id)
+
+# voting for a candidate
+def vote(sock, msg):
+    global term, voted_id
+    response = {SRCE: my_id,
+               DEST: msg[SRCE],
+               LEAD: 'FFFF',
+               TYPE: VOTE,
+               TERM: term,
+               VAL: 'false'
+               }
+    #if len(transaction_log) > 0:
+    #print("replica: %s our term: %d candidate term: %s voted for: %s" % (my_id, term, msg[TERM], voted_id))
+    if msg[TERM] >= term and voted_id == '':
+        if msg[TERM] > term:
+            term = msg[TERM]
+            replica_roles[my_id] = FOLL
+        if ((len(transaction_log) > 0 and msg[LLI] < len(transaction_log) and transaction_log[msg[LLI]][TERM] == msg[LLT]) and leader != 'FFFF'):
+            response = {SRCE: my_id,
+                 DEST: msg[SRCE],
+                 LEAD: 'FFFF',
+                 TYPE: VOTE,
+                 TERM: term,
+                 VAL: 'true'
+                 }
+            voted_id = msg[SRCE]
+            #print("replica %s voted for %s" % (my_id, msg[SRCE]))
+        elif leader == 'FFFF':
+            response = {SRCE: my_id,
+                    DEST: msg[SRCE],
+                    LEAD: 'FFFF',
+                    TYPE: VOTE,
+                    TERM: term,
+                    VAL: 'true'
+                    }
+            voted_id = msg[SRCE]
+            #print("replica %s voted for %s" % (my_id, msg[SRCE]))
+    sock.send(json.dumps(response).encode())
+
+
+# Set up who is a Leader, Follower, or Candidate
+
+
+######################## LOG REPLICATION ########################
+
+# The state machines and copying log information to send to other replicas
+
+def appendEntries(sock, heartbeat):
+    #print("log size is %d" % len(transaction_log))
+    prev_index = len(transaction_log) - 1
+    if prev_index < 0:
+        prev_term = None
+    else:
+        prev_term = transaction_log[prev_index][TERM]
+    for replica in replica_ids:
+        #entry = None
+        #print('the next index is %s and access this index %s' % (next_index, replica_ids.index(replica)))
+        if next_index[replica_ids.index(replica)] >= len(transaction_log):
+           entry = []
+        else:
+            num_entries = min(next_index[replica_ids.index(replica)] + 10, len(transaction_log) - 1)
+            entry = transaction_log[next_index[replica_ids.index(replica)]:num_entries]
+        msg = {SRCE: my_id,
+               DEST: replica,
+               LEAD: my_id,
+               TYPE: APEN,
+               TERM: term,
+               PLI: prev_index,
+               PLT: prev_term,
+               ENTR: entry,
+               LCOM: commit_index,
+               HRT: False}
+        #if heartbeat:
+            #msg.update({ENTR: {}, HRT: True})
+        sock.send(json.dumps(msg).encode())
+
+def update_state_machine(commit_idx):
+    #print("commit index is: %d length of log: %d occuring at replica: %s" % (commit_idx, len(transaction_log), my_id))
+    if len(transaction_log) > commit_idx:
+        entry = transaction_log[commit_idx]
+        if entry[TYPE] == 'put':
+            state_machine.update({entry[KEY]: entry[VAL]})
+
+def fail_(sock, msg):
+    fail_msg = {
+        SRCE: my_id,
+        DEST: replica,
+        LEAD: leader,
+        TYPE: FAIL,
+        MID: msg[MID]
+        }
+    sock.send(json.dumps(fail_msg).encode())
+
+def handle_get(msg):
+    entry = {
+    DEST: msg[DEST],
+    SRCE: msg[SRCE],
+    TERM: term,                
+    TYPE: msg[TYPE],
+    KEY: msg[KEY],
+    MID: msg[MID]
+    }
+    return entry
+
+def handle_put(msg):
+    entry = {
+    DEST: msg[DEST],
+    SRCE: msg[SRCE],
+    TYPE: msg[TYPE],
+    TERM: term,
+    KEY: msg[KEY],
+    VAL: msg[VAL],
+    MID: msg[MID]
+    }
+    return entry
+
+def handle_redirect(msg, sock):
+    response = {
+    SRCE: my_id,
+    DEST: msg[SRCE],
+    LEAD: leader,
+    TYPE: REDR,
+    MID: msg[MID]}
+    sock.send(json.dumps(response).encode())
+
+
+def handle_confirm(msg, sock):
+     response = {
+     SRCE: my_id,
+     DEST: leader,
+     LEAD: leader,
+     TYPE: 'ok',
+     ENTR: msg[ENTR],
+     TERM: term
+     } 
+
+     sock.send(json.dumps(response).encode())
+
+#Connect to the network. All messages to/from other replicas and clients will
+# occur over this socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+last = 0
+
+while True:
+    ready = select.select([sock], [], [], 0.1)[0]
+
+    clock = time.time()
+    if sock in ready:
+        msg_raw = sock.recv(62768)
+        if len(msg_raw) == 0: continue
+        msg = json.loads(msg_raw)
+
+        if msg['type'] in ['get', 'put']:
+
+            # transaction_log
+            if replica_roles[my_id] != LEAD:
+                if leader == 'FFFF' or replica_roles[my_id] == CAND or voted_id != '':
+                    request_queue.append(msg)
+                else:
+                    handle_redirect(msg, sock)
+
+            else:
+                entry = None
+                response = {
+                SRCE: msg[DEST],
+                DEST: msg[SRCE],
+                LEAD: leader,
+                TYPE: 'ok',
+                MID: msg[MID]
+                }
+                                   
+                if msg[TYPE] == 'get':
+                     entry = handle_get(msg)
+                    
+                else:
+                    entry = handle_put(msg)
+                if entry not in transaction_log:
+                    appendEntries(sock, False) 
+                #print(entry)
+                    transaction_log.append(entry)
+                    quorum.update({msg[MID]:1})
+                #print("leader log %s" % transaction_log)
+        elif msg[TYPE] == REQV:
+            vote(sock, msg)
+        elif msg[TYPE] == VOTE:
+            if msg[VAL] == 'true':
+                #print("%s received vote from %s" % (my_id, msg[SRCE]))
+                vote_count = vote_count + 1
+                if vote_count == (math.floor(len(replica_ids))/2) +1:
+                    #print("Leader is %s\n" % my_id)
+                    leader = my_id
+                    voted_id = ''
+                    replica_roles[my_id] = LEAD
+                    for replica in replica_ids:
+                       next_index.append(len(transaction_log))
+                    appendEntries(sock, True)
+                    for request in request_queue:
+                        entry = None
+                        response = {
+                                SRCE: request[DEST],
+                                DEST: request[SRCE],
+                                LEAD: leader,
+                                TYPE: 'ok',
+                                MID: request[MID]
+                                }
+                        if request[TYPE] == 'get':
+                             entry = handle_get(request)
+                             if request[KEY] not in state_machine:
+                                 response.update({VAL: ''})
+                             else:
+                                 #print('*************** GET THE VALUE IN STATE MACHINE AFTER ELECTION **************')
+                                 response.update({VAL: state_machine[request[KEY]]})
+                        elif request[TYPE] == 'put':
+                            entry = handle_put(request)
+                        #print(entry)
+                        if entry not in transaction_log:
+                            #appendEntries(sock, False)
+                            transaction_log.append(entry)
+                            quorum.update({entry[MID]:1})
+
+                        #sock.send(json.dumps(response).encode())
+                    request_queue = []
+
+       ################################ Followers Handle AppendEntries ################################
+        elif msg[TYPE] == APEN:
+             if leader != msg[LEAD] and (replica_roles[my_id] != LEAD or (leader == my_id and msg[TERM] > term)):
+                     leader = msg[LEAD]
+                     replica_roles[my_id] = FOLL
+                     replica_roles[leader] = LEAD 
+             if voted_id != '': 
+                 voted_id = ''
+             #false cases
+             if replica_roles[my_id] == FOLL:
+                if msg[TERM] < term or (len(transaction_log) > 0 and msg[PLI] < len(transaction_log) and  msg[PLT] != transaction_log[msg[PLI]][TERM]):
+                        #print('The most recent entry is %s' % (msg[ENTR][-1]))
+                        if msg[ENTR] == []:
+                             entry = {}
+                        else:
+                             entry = msg[ENTR][-1]
+                        response = {
+                         SRCE: my_id,
+                         DEST: msg[LEAD],
+                         LEAD: msg[LEAD],
+                         TYPE: False,
+                         ENTR: entry,
+                         TERM: term}
+                        sock.send(json.dumps(response).encode())
+                else:
+                     if msg[PLI] + 2 <= len(transaction_log):
+                         last_match = msg[PLI] + 1
+                         for entry in msg[ENTR]:
+                             if msg[TERM] != transaction_log[last_match][TERM] and entry != {} :
+                                 transaction_log = transaction_log[last_match:]
+                     # check to see if the entry can be commited
+                     # send back an ok or something
+                     for entry in msg[ENTR]:
+                         if entry != {} and entry not in transaction_log:
+                             transaction_log.append(entry)
+                             handle_confirm(msg, sock)
+                 
+                     if msg[LCOM] > commit_index:
+                         commit_index = min(msg[LCOM], msg[PLI] + 1)
+                         if commit_index > 0:
+                            update_state_machine(commit_index)
+                 
+                 
+                 #handle_confirm(msg, sock)
+             # Only followers recv apen msgs, therefore all messages mistakenly sent to it
+             # must be redirected
+                for request in request_queue:
+                     handle_redirect(request, sock)
+                request_queue = []
+                last = clock
+
+        ################################ Leader Calculates Quorum  ################################
+        elif msg[TYPE] == 'ok':
+            if msg[ENTR]:
+                #print("OK handle msg: %s" % msg)
+                #print('The entry is %s' % msg[ENTR])
+                if msg[TERM] > term:
+                    term = msg[TERM]
+                for entry in msg[ENTR]:
+                    quorum.update({entry[MID]: quorum.get(entry[MID]) + 1})
+                    #next_index[replica_ids.index(msg[SRCE])] = next_index[replica_ids.index(msg[SRCE])] + 1
+                    next_index[replica_ids.index(msg[SRCE])] = transaction_log.index(entry) + 1
+                    if quorum[entry[MID]] == math.floor(((len(replica_ids)+1) / 2))+1:
+                    # We have a quorum
+                        #print('quorum reached')
+                        commit_index = commit_index + 1
+                        response = {
+                        SRCE: entry[DEST],
+                        DEST: entry[SRCE],
+                        LEAD: leader,
+                        TYPE: 'ok',
+                        MID: entry[MID]
+                        }
+
+                        if entry[TYPE] == 'get':
+                            if entry[KEY] not in state_machine:
+                                response.update({VAL: ''})
+                            else:
+                                #print('*************** GET THE VALUE IN STATE MACHINE AFTER QUORUM **************')
+                                response.update({VAL: state_machine[entry[KEY]]})
+                        else:
+                            #print("leader applying put")
+                            state_machine.update({entry[KEY]: entry[VAL]})
+                        appendEntries(sock, False)
+                        sock.send(json.dumps(response).encode())
+                        #print("********************* response to MID %s" % msg[ENTR][MID])
+        elif msg[TYPE] == False:
+            if msg[ENTR] != {}: 
+                next_index[replica_ids.index(msg[SRCE])] = transaction_log.index(msg[ENTR]) - 1 
+            
+   # clock = time.time()
+        # keep alive message that the leader sends every second to replicas
+    if clock-last > (75 / 100)  and leader == my_id:
+        appendEntries(sock, True) 
+        last = clock
+    elif (clock-last > (timeout/100) or leader == "FFFF") and replica_roles[my_id] != CAND:
+        # Initiate election
+        #print("replica %s initiated an election" % my_id)
+        #print("clock-last: %d" % (clock-last))
+        election(sock)
+        last = clock
+    #elif (clock-last > (timeout*2)/100) and replica_roles[my_id] == CAND:
+        #election(sock)
+        #last = clock
+© 2021 GitHub, Inc.
